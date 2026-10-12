@@ -1,23 +1,71 @@
-# TreeExplainer Paper Repository
+library(survival)
+library(glmnet)
 
-<p align="center">
-  <img src="https://raw.githubusercontent.com/suinleelab/treeexplainer/master/images/overview_header.png" width="750" />
-</p>
+time_col <- "time"
+status_col <- "status"
 
----
+# 1. 严格过滤：只保留生存时间大于 0 的有效样本，并处理缺失值
+df_analysis_filtered <- df_analysis[!is.na(df_analysis[[time_col]]) & df_analysis[[time_col]] > 0, ]
 
-This repository contains notebook code and data for the paper: *Explainable AI for Trees: From Local Explanations to Global Understanding*
+# 2. 自动挑选缺失率低于 30% 的数值型特征
+all_numeric_cols <- names(df_analysis_filtered)[sapply(df_analysis_filtered, is.numeric)]
+candidate_cols <- setdiff(all_numeric_cols, c(time_col, status_col))
 
-This paper presents the first exact game theoretic solution for explaining predictions from tree ensemble models, the most widely used non-linear machine learning models; this solution is the only one that guarantees desirable properties and so enables new insights into individual predictions and global behavior of the model.
+missing_rates <- sapply(df_analysis_filtered[, candidate_cols], function(x) mean(is.na(x)))
+reasonable_cols <- names(missing_rates[missing_rates < 0.3])
 
-**Ways to explore the results and code behind the paper:**
-- Use TreeExplainer to explain your own tree-based models with the popular Python [shap package](https://github.com/slundberg/shap).
-    *  System requirements: Any recent Mac, Windows, or Linux OS. See https://anaconda.org/conda-forge/shap/files for a list of systems with precompiled binaries the codes is unit tested on.
-    * Installation: See https://github.com/slundberg/shap (install time is typically < 1 min)
-    * Demo: See the TreeExplainer demos at https://github.com/slundberg/shap, the demo on the front page runs in a few seconds on any modern computer.
+# 3. 提取数据并去除含 NA 的行
+sub_df <- df_analysis_filtered[, c(time_col, status_col, reasonable_cols)]
+df_clean <- sub_df[complete.cases(sub_df), ]
 
-- Check out the [local explanation benchmark](https://suinleelab.github.io/treeexplainer-study/benchmark/cric/index.html) results.
+cat(sprintf("过滤无效时间和缺失值后的有效样本量: %d\n", nrow(df_clean)))
 
-- Download the [NHANES I data](https://github.com/suinleelab/treeexplainer-study/tree/master/notebooks/mortality) (the chronic kidney disease and hospital datasets require approval for access)
+# 4. 构建特征矩阵 X，并剔除方差为 0 的列
+X_raw <- as.matrix(df_clean[, reasonable_cols])
+valid_cols <- c()
+for(col in reasonable_cols) {
+  x_vec <- X_raw[, col]
+  if(isTRUE(all(is.finite(x_vec))) && isTRUE(var(x_vec) > 0)) {
+    valid_cols <- c(valid_cols, col)
+  }
+}
 
-- Browse the [released notebooks](https://github.com/suinleelab/treeexplainer-study/tree/master/notebooks) (still under construction).
+X <- X_raw[, valid_cols, drop = FALSE]
+Y <- Surv(time = df_clean[[time_col]], event = df_clean[[status_col]])
+
+cat(sprintf("最终参与 Cox-Lasso 筛选的有效特征数: %d\n", ncol(X)))
+
+# 5. 安全运行 Cox-Lasso 交叉验证（显式指定 cox.ties 以消除警告）
+set.seed(42)
+cv_fit <- cv.glmnet(X, Y, family = "cox", alpha = 1, standardize = TRUE, nfolds = 10, cox.ties = "breslow")
+
+# 6. 提取最优 lambda 下的回归系数，并制作特征重要性排名表
+best_lambda <- cv_fit$lambda.min
+lasso_coefs <- coef(cv_fit, s = "lambda.min")
+coef_matrix <- as.matrix(lasso_coefs)
+
+selected_vars <- coef_matrix[coef_matrix[, 1] != 0, , drop = FALSE]
+
+ranking_df <- data.frame(
+  Feature = rownames(selected_vars),
+  Coefficient = selected_vars[, 1],
+  Abs_Coefficient = abs(selected_vars[, 1])
+)
+
+ranking_df <- ranking_df[order(ranking_df$Abs_Coefficient, decreasing = TRUE), ]
+ranking_df$Rank <- 1:nrow(ranking_df)
+
+# 7. 打印最终的特征排名榜
+print("=== 机器学习 Cox-Lasso 特征筛选与排名结果 ===")
+print(ranking_df[, c("Rank", "Feature", "Coefficient", "Abs_Coefficient")])
+
+# 8. 自动检查 phenoage0 或 phenoage_advance0 是否上榜
+target_vars <- c("phenoage0", "phenoage_advance0")
+for(v in target_vars) {
+  if(v %in% ranking_df$Feature) {
+    p_rank <- ranking_df$Rank[ranking_df$Feature == v]
+    cat(sprintf("\n👉 恭喜！'%s' 成功通过特征筛选，在所有变量中排名第 %d 位！\n", v, p_rank))
+  } else {
+    cat(sprintf("\n❌ 很遗憾，'%s' 的系数被压缩成了 0，在这次筛选中被剔除了。\n", v))
+  }
+}
