@@ -69,3 +69,35 @@ for(v in target_vars) {
     cat(sprintf("\n❌ 很遗憾，'%s' 的系数被压缩成了 0，在这次筛选中被剔除了。\n", v))
   }
 }
+library(survival)
+
+# 1. 提取刚才 Lasso 筛选出来的特征名称（假设您的 ranking_df 还在内存中）
+# 剔除掉生存时间和状态本身（如果它们在里面）
+lasso_vars <- ranking_df$Feature
+lasso_vars <- setdiff(lasso_vars, c("time", "status"))
+
+# 2. 动态拼装标准多因素 Cox 回归的公式
+# 格式为：Surv(time, status) ~ 变量1 + 变量2 + ...
+cox_formula <- as.formula(paste("Surv(time, status) ~", paste(lasso_vars, collapse = " + ")))
+
+# 3. 运行传统的多因素 Cox 回归 (Maximum Likelihood Estimation)
+multivar_cox <- coxph(cox_formula, data = df_clean)
+
+# 4. 查看详细的回归结果（包含系数、HR值、95%置信区间以及 p 值）
+summary_cox <- summary(multivar_cox)
+print(summary_cox)
+
+# 5. 如果你想更直观地提取出各变量的 HR 值和 p 值，可以这样做：
+coef_table <- as.data.frame(summary_cox$coefficients)
+conf_int <- as.data.frame(summary_cox$conf.int)
+
+result_df <- data.frame(
+  Feature = rownames(coef_table),
+  Coefficient = coef_table$coef,   HR = conf_int$`exp(coef)`,
+  HR_lower = conf_int$`lower .95`,
+  HR_upper = conf_int$`upper .95`,
+  P_value = coef_table$`Pr(>|z|)`
+)
+
+print("=== 传统多因素 Cox 回归最终结果与效应量 (HR) ===")
+print(result_df)
