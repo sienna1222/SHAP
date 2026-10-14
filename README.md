@@ -101,3 +101,114 @@ result_df <- data.frame(
 
 print("=== 传统多因素 Cox 回归最终结果与效应量 (HR) ===")
 print(result_df)
+# 1. 加载必要的依赖包
+library(mclust)       # 用于高斯混合模型 (GMM) 聚类
+library(survival)     # 用于生存分析
+library(survminer)    # 用于绘制高颜值生存曲线 (KM Curve)
+library(dplyr)        # 用于数据处理
+library(ranger)       # 用于高效计算特征重要性
+library(ggplot2)      # 用于绘图
+
+# -------------------------------------------------------------
+# 阶段一：数据准备与核心特征锁定
+# -------------------------------------------------------------
+# 使用截图中确认存在的准确列名（包含 egfr, phenoage0, bmi 以及对应的 z 标准化轴）
+cluster_vars <- c("egfr", "phenoage0", "bmi", "z_feat_alb", "z_feat_creat", "z_feat_glu", "z_feat_crp")
+time_col     <- "time"
+status_col   <- "status"
+
+# 提取并严格过滤缺失值
+required_cols <- c(time_col, status_col, cluster_vars)
+df_sub <- df_analysis_filtered[, intersect(names(df_analysis_filtered), required_cols)]
+df_cluster_clean <- na.omit(df_sub)
+
+cat(sprintf("👉 成功锁定有效聚类样本量: %d\n", nrow(df_cluster_clean)))
+
+# 矩阵标准化 (Z-score)
+X_scaled <- scale(df_cluster_clean[, cluster_vars])
+
+
+# -------------------------------------------------------------
+# 阶段二：运行 GMM (Gaussian Mixture Model) 无监督聚类
+# -------------------------------------------------------------
+set.seed(2026)
+# Mclust 会自动根据贝叶斯信息准则 (BIC) 寻找最优聚类数和模型结构
+gmm_model <- Mclust(X_scaled)
+
+# 打印聚类摘要（可查看最优分为几类）
+print(summary(gmm_model))
+
+# 将聚类标签安全赋回数据框并转换为因子
+df_cluster_clean$Cluster <- as.factor(gmm_model$classification)
+
+# 打印各亚群的绝对样本量与百分比占比
+cat("\n=== 各聚类亚群样本量分布 ===\n")
+print(table(df_cluster_clean$Cluster))
+cat("\n=== 各聚类亚群百分比占比 ===\n")
+print(prop.table(table(df_cluster_clean$Cluster)) * 100)
+
+
+# -------------------------------------------------------------
+# 阶段三：生存预后效能检验 (Validation)
+# -------------------------------------------------------------
+# 构建生存对象
+surv_obj <- Surv(time = df_cluster_clean[[time_col]], event = df_cluster_clean[[status_col]])
+
+# 1. 单/多因素 Cox 回归检验亚群间的死亡风险差异
+cox_model <- coxph(surv_obj ~ Cluster, data = df_cluster_clean)
+print("=== 聚类亚群的 Cox 预后回归结果 ===")
+print(summary(cox_model))
+
+# 2. 绘制高颜值 Kaplan-Meier 生存曲线
+fit_km <- survfit(surv_obj ~ Cluster, data = df_cluster_clean)
+
+p_km <- ggsurvplot(
+  fit_km,
+  data = df_cluster_clean,
+  pval = TRUE,                  # 自动计算并展示 Log-rank p 值
+  risk.table = TRUE,            # 展示下方风险表
+  surv.median.line = "hv",      # 展示中位生存时间线
+  palette = "jco",              # 采用高阶期刊配色 (JCO 风格)
+  ggtheme = theme_classic(),
+  title = "Kaplan-Meier Survival Curves by Data-Driven GMM Clusters",
+  xlab = "Follow-up Time (Days/Months)",
+  ylab = "Survival Probability"
+)
+
+print(p_km)
+
+
+# -------------------------------------------------------------
+# 阶段四：审稿人防御策略 —— 使用 ranger 评估特征对“区分亚群”的贡献度
+# -------------------------------------------------------------
+set.seed(2026)
+ranger_model <- ranger(
+  formula = Cluster ~ ., 
+  data = df_cluster_clean[, c(cluster_vars, "Cluster")], 
+  importance = "impurity",
+  num.trees = 500
+)
+
+# 提取特征重要性得分
+importance_scores <- ranger_model$variable.importance
+importance_df <- data.frame(
+  Feature = names(importance_scores),
+  Importance = as.numeric(importance_scores)
+) %>% arrange(desc(Importance))
+
+print("=== 各特征在驱动聚类分群中的重要性排序 (Ranger) ===")
+print(importance_df)
+
+# 绘制特征重要性条形图
+p_imp <- ggplot(importance_df, aes(x = reorder(Feature, Importance), y = Importance)) +
+  geom_bar(stat = "identity", fill = "steelblue", width = 0.7) +
+  coord_flip() +
+  theme_classic(base_size = 12) +
+  labs(
+    title = "Feature Importance in Driving Cluster Separation",
+    subtitle = "Evaluated via Ranger Random Forest (Impurity-based)",
+    x = "Clinical & Biological Features",
+    y = "Variable Importance (Decrease in Impurity)"
+  )
+
+print(p_imp)
